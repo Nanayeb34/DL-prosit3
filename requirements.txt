@@ -1,0 +1,14 @@
+huggingface_hub  
+jiwer
+ffmpeg<8
+torchcodec
+inflect
+pandas
+datasets
+transformers
+librosa
+accelerate
+peft
+bitsandbytes
+evaluate
+tensorboardX
