@@ -128,8 +128,6 @@ def train_wav2vec_full():
         ctc_loss_reduction="mean",
         pad_token_id=processor.tokenizer.pad_token_id,
         vocab_size=len(processor.tokenizer),
-        torch_dtype=torch.float16,
-        device_map="auto",
         ignore_mismatched_sizes=True
     )
 
