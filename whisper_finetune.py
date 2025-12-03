@@ -318,7 +318,7 @@ def download_dataset():
 @app.function(
     image=image,
     volumes={"/my_vol": volume},
-    gpu="L40S",  # or "A10G", "T4", etc.
+    gpu="L40S",  
     timeout=3600 * 10,  # 10 hours for training
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -449,6 +449,156 @@ def train():
 @app.function(
     image=image,
     volumes={"/my_vol": volume},
+    gpu="L40S",
+    timeout=3600 * 10,  # 10 hours for training
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def resume_training(additional_epochs=3, new_model_name="afrispeech-twi-zulu-akan-extended"):
+    """Resume training from the last checkpoint for additional epochs"""
+    import pandas as pd
+    from transformers import WhisperForConditionalGeneration
+    from peft import PeftModel, LoraConfig
+    from datasets import load_from_disk
+    from transformers import Seq2SeqTrainingArguments
+    from transformers import WhisperFeatureExtractor
+    from transformers import WhisperTokenizer
+    from transformers import WhisperProcessor
+    import torch
+    import evaluate
+    from transformers import Seq2SeqTrainer
+    import os
+    import glob
+
+    print("Loading preprocessed dataset...")
+    dataset = load_from_disk("/my_vol/preprocessed_dataset")
+    metric = evaluate.load("wer")
+
+    print("Loading processor...")
+    processor = WhisperProcessor.from_pretrained("distil-whisper/distil-large-v3", task="transcribe")
+
+    print("Loading base model...")
+    # Load the base model
+    model = WhisperForConditionalGeneration.from_pretrained(
+        "distil-whisper/distil-large-v3",
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+
+    print("Loading PEFT adapter from checkpoint...")
+    # Load the trained PEFT adapter from the final model
+    model = PeftModel.from_pretrained(model, "/my_vol/final_model")
+
+    # IMPORTANT: Re-enable training for the adapter parameters
+    # When loading a PEFT model, parameters aren't automatically set to trainable
+    for param in model.parameters():
+        param.requires_grad = False  # First freeze everything
+
+    # Then unfreeze only the LoRA parameters
+    for name, param in model.named_parameters():
+        if "lora" in name.lower():
+            param.requires_grad = True
+
+    # Configure model
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    model.config.use_cache = False
+
+    print("Model loaded successfully!")
+    model.print_trainable_parameters()
+
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
+    # New output directory and hub model ID
+    new_output_dir = f"/my_vol/checkpoints_{new_model_name}"
+    new_hub_id = f"sirsam01/{new_model_name}"
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=new_output_dir,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
+        learning_rate=5e-4,  # Slightly lower LR for continued training
+        warmup_steps=50,  # Fewer warmup steps since already trained
+        num_train_epochs=additional_epochs,
+        gradient_checkpointing=False,
+        fp16=True,
+        eval_strategy="steps",
+        per_device_eval_batch_size=4,
+        predict_with_generate=True,
+        generation_max_length=128,
+        save_steps=200,
+        eval_steps=50,
+        logging_steps=50,
+        report_to=["tensorboard"],
+        logging_dir=f"/my_vol/logs_{new_model_name}",
+        load_best_model_at_end=True,
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        remove_unused_columns=False,
+        label_names=["labels"],
+        optim='adamw_torch_fused',
+        push_to_hub=True,
+        hub_token=os.environ.get("HF_TOKEN"),
+        hub_model_id=new_hub_id,
+        hub_strategy="checkpoint",
+    )
+
+    trainer = Seq2SeqTrainer(
+        args=training_args,
+        model=model,
+        train_dataset=dataset['train'],
+        eval_dataset=dataset['dev'],
+        data_collator=data_collator,
+        compute_metrics=lambda pred: compute_metrics(pred, processor.tokenizer, metric),
+        callbacks=[SavePeftModelCallback()],
+        processing_class=processor.feature_extractor
+    )
+
+    processor.save_pretrained(training_args.output_dir)
+
+    print(f"\n{'='*60}")
+    print(f"Resuming training for {additional_epochs} more epochs")
+    print(f"New model will be saved as: {new_hub_id}")
+    print(f"{'='*60}\n")
+
+    # Resume training (no resume_from_checkpoint needed since model is already loaded)
+    trainer.train()
+
+    # Save final model
+    final_model_path = f"/my_vol/final_model_{new_model_name}"
+    model.save_pretrained(final_model_path)
+    processor.save_pretrained(final_model_path)
+
+    # Save training metrics
+    import json
+    metrics_path = f"/my_vol/training_metrics_{new_model_name}.json"
+    with open(metrics_path, "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"✅ Resumed training complete!")
+    print(f"{'='*60}")
+    print(f"  - Model saved to volume: {final_model_path}")
+    print(f"  - Metrics saved to: {metrics_path}")
+    print(f"  - TensorBoard logs: /my_vol/logs_{new_model_name}")
+    print(f"  - Model pushed to HuggingFace Hub: {new_hub_id}")
+    print(f"{'='*60}\n")
+
+    # Commit volume changes
+    from modal import Volume
+    vol = Volume.from_name(VOLUME_NAME)
+    vol.commit()
+
+    return {
+        "status": "success",
+        "model_id": new_hub_id,
+        "final_model_path": final_model_path,
+        "metrics_path": metrics_path,
+        "logs_path": f"/my_vol/logs_{new_model_name}"
+    }
+
+@app.function(
+    image=image,
+    volumes={"/my_vol": volume},
 )
 def plot_training_curves():
     """Generate and save training/validation curves as images"""
@@ -459,7 +609,7 @@ def plot_training_curves():
     from pathlib import Path
 
     # Load metrics
-    metrics_path = "/my_vol/training_metrics.json"
+    metrics_path = "/my_vol/training_metrics_afrispeech-twi-zulu-akan-extended.json"
     with open(metrics_path, "r") as f:
         log_history = json.load(f)
 
@@ -504,7 +654,7 @@ def plot_training_curves():
     plt.tight_layout()
 
     # Save plot
-    plot_path = "/my_vol/training_curves.png"
+    plot_path = "/my_vol/extended_training_curves.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -544,11 +694,11 @@ def evaluate_test_set():
         device_map="auto"
     )
     # Load PEFT adapter
-    model = PeftModel.from_pretrained(model, "/my_vol/final_model")
+    model = PeftModel.from_pretrained(model, "/my_vol/final_model_afrispeech-twi-zulu-akan-extended")
     model.eval()
 
     # Load processor
-    processor = WhisperProcessor.from_pretrained("/my_vol/final_model")
+    processor = WhisperProcessor.from_pretrained("/my_vol/final_model_afrispeech-twi-zulu-akan-extended")
 
     # Load WER metric
     metric = evaluate.load("wer")
@@ -597,7 +747,7 @@ def evaluate_test_set():
         ]
     }
 
-    results_path = "/my_vol/test_evaluation_results.json"
+    results_path = "/my_vol/extended_test_evaluation_results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -656,6 +806,23 @@ def web():
             "status": "success",
             "job_id": job_id,
             "message": "Training started"
+        }
+
+    @web_app.post("/resume-training")
+    async def resume_training_endpoint(epochs: int = 3, model_name: str = "afrispeech-twi-zulu-akan-extended"):
+        """Resume training from the saved checkpoint for additional epochs"""
+        call = resume_training.spawn(additional_epochs=epochs, new_model_name=model_name)
+        job_id = call.object_id
+        print(f"\n✅ Resume training job spawned: {job_id}")
+        print(f"Training for {epochs} additional epochs as: {model_name}")
+        print("Waiting 30 seconds to confirm job submission...")
+
+        time.sleep(30)
+
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "message": f"Resumed training for {epochs} more epochs. New model: {model_name}"
         }
 
     @web_app.post("/plot-curves")
